@@ -7,9 +7,9 @@ Covers: Lane 1 (enqueue request) → Lane 2 (fetch offline messages) → Lane 3
   - MarkDelivery.js            (message service — queries Mongo, replies)
   - updateDeliveryStatus.js    (message service — marks delivered in Mongo)
 
-Framework per decision: PURPOSE → PROBLEM → SOLUTION → HISTORY (if the decision
-changed after being first implemented, because of a new test case or a flaw
-found later, that revision is recorded here too).
+I'm logging each decision as: PURPOSE → PROBLEM → SOLUTION → HISTORY (where
+HISTORY only appears if I changed my mind after first implementing something,
+because a new test case or a flaw I hadn't considered showed up later).
 
 ================================================================================
 DECISION 1 — Reply Queue Design: Anonymous Exclusive Queue Per Request
@@ -21,195 +21,189 @@ that user's offline messages, and needs a private channel to receive the
 reply on.
 
 PROBLEM
-The original design named the reply queue after the userid:
+I originally named the reply queue after the userid:
     const replyQueue = `offline.reply.${userid}`;
-This queue was shared across every request from that same user. If a user
-reconnected twice in quick succession (e.g. logs in, immediately refreshes
-the page — a realistic scenario, not hypothetical), two separate requests
-would both attach a consumer to the SAME queue. RabbitMQ does not deliver a
-message to every consumer on a queue — it picks one (competing-consumers
-behavior). This meant request A's reply could be handed to request B's
-consumer by mistake. Even with a correlationId check in place to detect the
-mismatch, the outcome was the same: the wrong consumer would ack-and-discard
-the message, request A's consumer would never receive anything and would
-hang forever waiting, and the user's offline messages would be silently
-lost for that connection attempt.
+This queue was shared across every request from the same user. If a user
+reconnected twice in quick succession — logs in, immediately refreshes the
+page, a scenario I actually expect to happen in practice — two separate
+requests would both attach a consumer to the SAME queue. RabbitMQ doesn't
+deliver a message to every consumer on a queue, it picks one (competing-
+consumers behavior). So request A's reply could get handed to request B's
+consumer by mistake. I had a correlationId check in place to catch the
+mismatch, but that didn't actually save me: the wrong consumer would just
+ack-and-discard the message, request A's consumer would never receive
+anything and would hang forever, and the user's offline messages would be
+silently lost for that connection attempt.
 
 SOLUTION
-Switched to a RabbitMQ-generated anonymous queue, unique per individual
-request, not per user:
+I switched to a RabbitMQ-generated anonymous queue, unique per individual
+request instead of per user:
     const { queue: replyQueue } = await channel.assertQueue("", {
       exclusive: true,
       autoDelete: true,
     });
 Passing an empty string as the queue name tells RabbitMQ to generate a
-guaranteed-unique name for this specific call. Two concurrent requests from
-the same user now get two physically different queues, so there is no
-competing-consumer scenario — misdelivery becomes structurally impossible
-rather than something merely detected and worked around after the fact.
+guaranteed-unique name for that specific call. Two concurrent requests from
+the same user now get two physically different queues, so there's no
+competing-consumer scenario at all — misdelivery becomes structurally
+impossible instead of something I'm just detecting and working around after
+the fact.
 
 HISTORY
-Initially considered naming the queue after the correlationId instead
-(`offline.reply.${correlationId}`) as an alternative fix — this would have
-worked equally well, since correlationId is also unique per request (from
-uuidv4()). The anonymous RabbitMQ-generated name was chosen instead because
-it delegates the uniqueness guarantee to the broker rather than requiring
-manual string construction, and matches the idiomatic RPC pattern RabbitMQ
-itself recommends (similar to the built-in amq.rabbitmq.reply-to mechanism).
-No functional difference between the two options — a naming/idiom preference,
-not a bug fix.
+I initially considered naming the queue after the correlationId instead
+(`offline.reply.${correlationId}`) — that would've worked equally well,
+since correlationId is also unique per request (from uuidv4()). I went with
+the anonymous RabbitMQ-generated name instead because it delegates the
+uniqueness guarantee to the broker rather than me hand-building the string,
+and it matches the idiomatic RPC pattern RabbitMQ itself recommends (close
+to the built-in amq.rabbitmq.reply-to mechanism). No functional difference
+between the two — just a naming/idiom preference, not a bug fix.
 
 ================================================================================
 DECISION 2 — Removal of correlationId
 ================================================================================
 
 PURPOSE
-Originally, correlationId was added as a second layer of verification: once
-a reply landed in a queue, check its correlationId matched the one expected,
-to guard against the reply belonging to a different request.
+I'd added correlationId as a second layer of verification: once a reply
+landed in a queue, check its correlationId matched what I expected, to guard
+against the reply belonging to a different request.
 
 PROBLEM
-This was necessary defense when queues were shared per-user (Decision 1's
-original design) — the correlationId check was the only thing standing
+That was necessary defense back when queues were shared per-user (Decision
+1's original design) — the correlationId check was the only thing standing
 between "wrong message accepted" and "wrong message rejected." But it never
-prevented the wrong message from being CONSUMED in the first place — it
-only prevented it from being misused once consumed. The actual message
-would still be silently discarded by the wrong consumer, and the rightful
+actually prevented the wrong message from being CONSUMED in the first place
+— it only stopped it from being misused once consumed. The message would
+still get silently discarded by the wrong consumer, and the rightful
 consumer would still hang forever. So correlationId was solving the wrong
-half of the problem.
+half of the problem the whole time.
 
-Once Decision 1 was implemented (anonymous exclusive queue per request),
-correlationId became vestigial: with one queue per request, nothing else
+Once I implemented Decision 1 (anonymous exclusive queue per request),
+correlationId became vestigial — with one queue per request, nothing else
 can ever land in that queue, so the "is this really my reply" check can
-never meaningfully fail. Keeping it added a field to every payload and a
-check in every consumer for no remaining benefit.
+never meaningfully fail. I was keeping a field in every payload and a check
+in every consumer for zero remaining benefit.
 
 SOLUTION
-Removed correlationId entirely — no longer generated (`uuidv4()` import
-dropped), no longer included in message payloads, no longer checked in the
-consumer callback. Simplified message shapes in all three files.
+I removed correlationId entirely — stopped generating it (dropped the
+`uuidv4()` import), stopped including it in payloads, stopped checking it in
+the consumer callback. Simplified the message shape across all three files.
 
 HISTORY
-This was a mid-conversation reversal. correlationId was first re-confirmed
-as necessary ("keep both — anonymous queue for routing, correlationId for
-identity verification") when the anonymous-queue fix was first introduced,
-under the reasoning that it was still useful "belt and suspenders" defense.
-After further discussion clarified that the check could now never actually
-trigger (since queues are exclusive and unshared), the decision was
-reversed: correlationId was deemed genuinely dead code, not defense in
-depth, and removed. The trigger for reversal was recognizing that code
-which can never meaningfully fail is worse than no code, not a new test
-case exactly, but a re-examination of what the "defense" was actually
-defending against.
+This was a reversal I made mid-build. I'd first told myself to keep both —
+anonymous queue for routing, correlationId for identity verification —
+treating it as harmless "belt and suspenders" defense. It took actually
+tracing through what the check could still catch, post-Decision-1, to
+realize it could never trigger anymore. Once I saw that, I called it what it
+was: dead code, not defense in depth, and pulled it out. The trigger for
+reversing wasn't a new bug — it was re-examining what the "defense" was
+actually still defending against and realizing the answer was nothing.
 
 ================================================================================
 DECISION 3 — Error Signaling in Reply Payloads
 ================================================================================
 
 PURPOSE
-The message service needs a way to tell the main service "here are your
-offline messages" vs. "something went wrong on our end, we couldn't fetch
-your messages" — two very different situations that the main service (and
-ultimately the user) needs to be able to tell apart.
+I needed the message service to be able to tell the main service "here are
+your offline messages" versus "something went wrong on our end, we couldn't
+fetch your messages" — two very different situations that the main service,
+and ultimately the user, needs to be able to tell apart.
 
 PROBLEM
-Originally, replies were bare arrays:
+Originally my replies were bare arrays:
     channel.sendToQueue(replyTo, Buffer.from(JSON.stringify(messages)));
-This meant an empty array meant one of two things with no way to
-distinguish them: (a) the user genuinely has zero offline messages
-(normal, happy path), or (b) the message service tried and failed to fetch
-messages (e.g. after exhausting retry attempts during a Mongo outage) and
-gave up, sending an empty array as a last resort. From the main service's
-perspective, and ultimately the user's, both looked identical — the user
-would simply appear to have no offline messages, with no indication
-anything had gone wrong. Messages would remain `status: "sent"` in Mongo
-and only surface again on the user's NEXT reconnect attempt, but the user
-had no way to know that's what happened.
+That meant an empty array could mean one of two things with no way to tell
+them apart: (a) the user genuinely has zero offline messages — the normal,
+happy path — or (b) I tried and failed to fetch messages (say, after
+exhausting retries during a Mongo outage) and gave up, sending an empty
+array as a last resort. From the main service's side, and ultimately the
+user's, both looked identical — the user would just appear to have no
+offline messages, no indication anything had gone wrong. The messages would
+stay `status: "sent"` in Mongo and only surface again on the user's NEXT
+reconnect, but they'd have no way of knowing that's what happened.
 
 SOLUTION
-Changed every reply payload to a consistent object shape instead of a bare
+I changed every reply payload to a consistent object shape instead of a bare
 array:
     { error: boolean, messages: array }
-`error: false` on genuine success (including the legitimate zero-messages
-case). `error: true` on give-up-after-failure. The main service now checks
-the `error` flag explicitly and logs a distinct message
-("failed to fetch offline messages... will retry on next reconnect")
-rather than silently treating a failure identically to an empty inbox.
+`error: false` on genuine success, including the legitimate zero-messages
+case. `error: true` when I've given up after failure. The main service now
+checks the `error` flag explicitly and logs a distinct message ("failed to
+fetch offline messages... will retry on next reconnect") instead of
+silently treating a failure the same as an empty inbox.
 
 HISTORY
-This was raised directly by the developer, who rejected the initial
-proposal to leave failure indistinguishable from empty ("no" — explicit,
-immediate). The fix required touching every single sendToQueue call across
-both MarkDelivery.js and processOfflineMessages.js to keep the payload
-shape consistent everywhere (success paths, invalid-userid discard path,
-permanent-failure path, retry-exhausted path) — a deliberate decision to
-have ONE consistent shape rather than bare-array-on-success and
-object-on-failure, specifically because a mixed shape was judged likely to
-cause exactly the kind of silent bug this whole session was about fixing.
+I wasn't satisfied leaving failure indistinguishable from empty and decided
+against it outright once I actually thought through what it meant for the
+user. Fixing it meant touching every single sendToQueue call across both
+MarkDelivery.js and processOfflineMessages.js to keep the payload shape
+consistent everywhere — success paths, the invalid-userid discard path, the
+permanent-failure path, the retry-exhausted path. I deliberately went with
+ONE consistent shape everywhere rather than bare-array-on-success and
+object-on-failure, because a mixed shape felt like exactly the kind of thing
+that causes silent bugs later — which is the whole category of problem I was
+trying to get out of in this feature.
 
 ================================================================================
 DECISION 4 — Bounded Retry on Transient Mongo Failures (MarkDelivery.js)
 ================================================================================
 
 PURPOSE
-MarkDelivery queries MongoDB for a user's offline messages. This query can
-fail if MongoDB is briefly unreachable (a "blip") — a real, not
-hypothetical, scenario: a user can log in and immediately refresh the page,
+MarkDelivery queries MongoDB for a user's offline messages. That query can
+fail if MongoDB is briefly unreachable — a real scenario I want to handle,
+not a hypothetical one: a user can log in and immediately refresh the page,
 and if Mongo hiccups in that exact window, the request would previously be
 lost outright.
 
 PROBLEM
-The original catch block treated every error identically:
+My original catch block treated every error identically:
     channel.nack(message, false, false);
-`requeue: false` discards the message permanently on ANY error, including
-a one-second Mongo connection blip that would very likely have succeeded
-on a retry a moment later. There was no distinction between a transient
-failure (worth retrying) and a permanent one (retrying is pointless,
-e.g. malformed input).
+`requeue: false` discards the message permanently on ANY error, including a
+one-second Mongo connection blip that would very likely have succeeded on a
+retry a moment later. I wasn't distinguishing a transient failure (worth
+retrying) from a permanent one (retrying is pointless — e.g. malformed
+input).
 
 SOLUTION
-Errors are now categorized by `error.name`:
-  - `MongooseServerSelectionError` or `MongoNetworkError` → treated as
-    transient. The function retries the same query in a loop, waiting 1
-    second between attempts, for up to 10 seconds total, before finally
-    giving up.
-  - Any other error → treated as permanent. Replies immediately with
-    `{error: true, messages: []}` and discards without retry.
+I now categorize errors by `error.name`:
+  - `MongooseServerSelectionError` or `MongoNetworkError` → transient. I
+    retry the same query in a loop, waiting 1 second between attempts, for
+    up to 10 seconds total, before finally giving up.
+  - Anything else → permanent. I reply immediately with
+    `{error: true, messages: []}` and discard without retry.
 
-A deliberate choice was made NOT to use RabbitMQ's native
-nack-with-requeue-and-retry-count mechanism (which would need custom
-message headers, since nack() cannot modify a message before requeuing —
-it would require ack-then-republish to increment a counter). Instead,
-retrying happens entirely in-process via a plain while-loop with a
-timestamp deadline, while the original message stays unacked throughout.
-This was chosen because a Dead Letter Exchange (DLX) — RabbitMQ's built-in
-mechanism for this kind of thing — was explicitly ruled out (see Decision
-6's history) as unnecessary complexity for a problem that a simple
-time-bounded retry already solves.
+I deliberately did NOT use RabbitMQ's native nack-with-requeue-and-retry-
+count mechanism, which would've needed custom message headers, since nack()
+can't modify a message before requeuing — I'd have had to ack-then-republish
+just to increment a counter. Instead, the retry happens entirely in-process,
+a plain while-loop against a timestamp deadline, with the original message
+staying unacked the whole time. I made this call because I'd already ruled
+out needing a Dead Letter Exchange (see Decision 6's history) — DLX felt
+like unnecessary machinery for a problem a simple time-bounded retry already
+solves.
 
 HISTORY
-This decision went through real back-and-forth before settling:
-  1. First considered whether JavaScript has Java-style typed exceptions to
-     distinguish error categories — confirmed it does, via `error.name` on
-     specific error classes thrown by Mongoose/MongoDB driver.
-  2. Considered a DLX + message-header retry-count approach — this was
-     the "correct production answer" but required restructuring nack into
-     ack-and-republish. Explicitly deferred as unnecessary once the
-     developer clarified the actual requirement: for both a brief Mongo
-     blip and a longer outage, the correct behavior is the same —
-     time-bounded retry, then give up cleanly. This does not need
-     RabbitMQ's DLX machinery at all, since DLX solves a different problem
-     (permanently routing failed messages for later manual inspection),
-     not "retry for N seconds then bail."
-  3. Settled on the in-process while-loop retry as the simplest solution
-     that actually matches the stated requirement, holding the original
-     message unacked for the retry duration rather than touching RabbitMQ's
-     redelivery mechanics at all.
+I went back and forth on this before settling:
+  1. First I checked whether JS even has Java-style typed exceptions to
+     distinguish error categories — it does, via `error.name` on the
+     specific error classes Mongoose/the MongoDB driver throw.
+  2. I considered a DLX plus message-header retry-count approach — the
+     "correct production answer" on paper, but it meant restructuring nack
+     into ack-and-republish. I dropped it once I was honest with myself
+     about the actual requirement: for both a brief blip and a longer
+     outage, the correct behavior is the same — retry for a bounded window,
+     then give up cleanly. That doesn't need DLX at all; DLX solves a
+     different problem (permanently routing failed messages for later
+     manual inspection), not "retry for N seconds then bail."
+  3. I settled on the in-process while-loop retry as the simplest thing
+     that actually matches what I need, holding the message unacked for the
+     retry window instead of touching RabbitMQ's redelivery mechanics at
+     all.
 
-Known accepted gap (not fixed, deliberately deferred): no backoff — if
-Mongo is down for the full 10-second window, this retries every 1 second
-with no increasing delay, which could contribute to load during a real
-outage. Accepted as acceptable for current scale.
+Known accepted gap, not fixed, deliberately left alone: no backoff. If Mongo
+is down for the full 10 seconds, I'm retrying every 1 second flat, no
+increasing delay — that could add load during a real outage. Acceptable at
+my current scale, revisit later if it isn't.
 
 ================================================================================
 DECISION 5 — Timeout Protection on the Waiting Consumer (processOfflineMessages.js)
@@ -217,39 +211,37 @@ DECISION 5 — Timeout Protection on the Waiting Consumer (processOfflineMessage
 
 PURPOSE
 After sending a request to MarkDelivery, processOfflineMessages sits in a
-`channel.consume()` callback waiting for a reply. This wait needs a bound —
-otherwise, what happens if no reply ever arrives?
+`channel.consume()` callback waiting for a reply. That wait needs a bound —
+what happens if no reply ever arrives?
 
 PROBLEM
-Without any timeout, if MarkDelivery crashed entirely, or hung for some
-reason outside the retry logic in Decision 4, or a reply was sent to a
-queue that no longer had an active consumer, this consumer would wait
-indefinitely. Each occurrence leaks one queue and one hung consumer
-permanently for the life of the process — a resource leak with no upper
-bound, and the user's connection handling would effectively never resolve.
+Without a timeout, if MarkDelivery crashed entirely, or hung for some reason
+outside the retry logic in Decision 4, or a reply landed on a queue that no
+longer had an active consumer, this would wait indefinitely. Every
+occurrence leaks one queue and one hung consumer for the life of the
+process — no upper bound, and the user's connection handling would never
+actually resolve.
 
 SOLUTION
-Added a 15-second timeout (chosen deliberately longer than MarkDelivery's
-10-second retry window from Decision 4, so MarkDelivery gets a fair chance
-to complete its own retry logic before the main service gives up waiting).
-If the timeout fires before a reply arrives, it cancels the consumer and
-logs the timeout. A `timedOut` flag guards against a race condition where a
-genuine reply arrives at nearly the same moment the timeout fires — the
-consumer callback checks this flag first and ignores late replies once
-timed out, and conversely the successful-reply path calls
-`clearTimeout()` immediately so the timeout does not fire spuriously after
-a message has already been handled.
+I added a 15-second timeout — deliberately longer than MarkDelivery's
+10-second retry window from Decision 4, so MarkDelivery gets a fair shot at
+finishing its own retries before I give up waiting on it. If the timeout
+fires before a reply arrives, it cancels the consumer and logs it. A
+`timedOut` flag guards a race where a genuine reply arrives right as the
+timeout is about to fire — the consumer callback checks that flag first and
+ignores late replies once timed out, and on the success path I call
+`clearTimeout()` immediately so the timer doesn't fire spuriously after I've
+already handled the message.
 
 HISTORY
-This point was discussed and its code written correctly early on, but was
-NOT actually applied to the developer's real file for several conversation
-turns — a real gap between "the code exists in the conversation" and "the
-code is in the file that runs." This was caught only when the developer was
-asked to paste their current file for an unrelated confirmation, and it
-became clear point 5 had never been copied over despite an earlier "done"
-confirmation. Re-applied and re-confirmed correctly the second time. No
-design change occurred — this was a copy-paste/tracking gap, not a
-re-thought decision.
+This is a mistake worth being honest about: I designed and wrote this fix
+correctly early on, but didn't actually apply it to my real file for several
+sessions — a real gap between "I've written this code" and "this code is in
+the file that runs." I only caught it when I went back to paste my current
+file for an unrelated check and realized point 5 had never actually made it
+in, despite me having said "done" earlier. Re-applied it, re-confirmed it
+properly the second time. No design change here — this was a tracking gap
+on my part, not a re-thought decision.
 
 ================================================================================
 DECISION 6 — Removal of Dead Letter Queue (DLQ); Validation Moved Upstream
@@ -257,296 +249,274 @@ DECISION 6 — Removal of Dead Letter Queue (DLQ); Validation Moved Upstream
 
 PURPOSE
 updateDeliveryStatus.js marks messages as "delivered" in MongoDB once
-they've been confirmed received by the client. This update can fail for two
-different reasons, and the question was what to do with a failure that
-retrying will never fix (e.g. a malformed MongoDB ObjectId in the batch).
+they're confirmed received by the client. That update can fail for two
+different kinds of reasons, and I had to decide what to do with a failure
+that retrying will never fix — like a malformed MongoDB ObjectId showing up
+in the batch.
 
-PROBLEM (as originally solved)
-A DLQ (`updateDeliveryStatus-dlq`) was introduced: on a permanently
-malformed ID, or any non-connection error, the failing message was
-forwarded to this separate queue instead of being silently discarded,
-intended to preserve it for later audit or debugging.
+PROBLEM (as I originally solved it)
+I introduced a DLQ (`updateDeliveryStatus-dlq`): on a permanently malformed
+ID, or any non-connection error, I'd forward the failing message to this
+separate queue instead of silently discarding it, meaning to preserve it for
+later audit or debugging.
 
-Under closer examination, this DLQ turned out to solve nothing. Walking
-through where these malformed IDs would actually originate: `deliveredIds`
-inside processOfflineMessages is built entirely from `msgs._id` — MongoDB's
-own ObjectIds from a document that was already successfully queried and
-already successfully delivered to the client. These values do not pass
-through user input or an external API at any point in this flow. A
-malformed ID reaching updateDeliveryStatus would necessarily indicate a
-BUG somewhere upstream in this service's own code, not a data-quality
-issue from an external or untrusted source. Given that, nothing useful can
-actually be DONE with a message sitting in a DLQ — you cannot "fix" a bad
-ObjectId by inspecting it later; the fix has to happen at the point the bad
-ID was generated, not downstream of it.
+Sitting with it longer, I realized this DLQ solved nothing. Tracing through
+where a malformed ID could actually come from: `deliveredIds` inside
+processOfflineMessages is built entirely from `msgs._id` — MongoDB's own
+ObjectIds, from documents I'd already successfully queried and already
+successfully delivered to the client. These values never pass through user
+input or any external API anywhere in this flow. If a malformed ID ever
+reached updateDeliveryStatus, that would mean a BUG somewhere upstream in my
+own code — not a data-quality problem from an untrusted source. Given that,
+there's nothing useful I can actually DO with a message sitting in a DLQ —
+I can't "fix" a bad ObjectId by looking at it later; the fix has to happen
+at the point the bad ID got generated, not downstream of it.
 
 SOLUTION
-1. Removed the DLQ entirely from updateDeliveryStatus.js — no more
-   `updateDeliveryStatus-dlq` queue assertion, no more
-   invalidIds-filter-and-forward block, no more mongoose import in that
-   file (validation moved elsewhere, so it was no longer needed there).
-2. Added validation UPSTREAM instead, in processOfflineMessages.js,
-   immediately before deliveredIds is sent to updateDeliveryStatus:
+1. I removed the DLQ entirely from updateDeliveryStatus.js — no more
+   `updateDeliveryStatus-dlq` queue assertion, no more invalidIds-filter-
+   and-forward block, no more mongoose import in that file (validation
+   moved elsewhere, so it wasn't needed here anymore).
+2. I added validation UPSTREAM instead, in processOfflineMessages.js, right
+   before deliveredIds gets sent to updateDeliveryStatus:
      const validIds = deliveredIds.filter((id) =>
        mongoose.Types.ObjectId.isValid(id),
      );
-   If any IDs fail this check, a `console.log("BUG: ...")` fires — labeled
-   explicitly as a bug, not a normal/expected code path, since (per the
-   reasoning above) this should structurally never happen given where
-   these IDs originate. Only validIds are forwarded downstream.
+   If any IDs fail this check, I log it explicitly as `"BUG: ..."` — not
+   framed as a normal/expected path, because per the reasoning above this
+   should structurally never happen given where these IDs come from. Only
+   validIds get forwarded downstream.
 
-Known accepted gap: if this upstream validation is ever bypassed or has
-its own bug, and a bad ID reaches updateDeliveryStatus anyway, it will now
-throw a Mongoose CastError inside the try block there. CastError is not
-`MongooseServerSelectionError` or `MongoNetworkError`, so it will be
-classified as a permanent (non-connection) failure and silently
-nack-discarded with no DLQ and no trace — since the DLQ safety net was
-removed. This was an explicitly acknowledged tradeoff, not an oversight:
-the developer was asked directly whether this silent-discard-on-a-bug
-scenario was acceptable, on the reasoning that the upstream validation
-should make it unreachable in practice.
+Known accepted gap: if this upstream validation ever gets bypassed or has
+its own bug, and a bad ID reaches updateDeliveryStatus anyway, it'll now
+throw a Mongoose CastError inside the try block there. CastError isn't
+`MongooseServerSelectionError` or `MongoNetworkError`, so it'll get
+classified as a permanent (non-connection) failure and silently nack-
+discarded with no DLQ and no trace, since I removed that safety net. I
+thought this through deliberately rather than missing it — I'm trusting the
+upstream validation to make this path unreachable in practice.
 
 HISTORY
-This is the decision with the most back-and-forth in the entire session:
-  1. DLQ was first proposed and built as "the safer option" in direct
-     response to being asked to choose between "blindly discard malformed
-     IDs" and "validate before attempting the update, reject the whole
-     batch if any ID is invalid, send to a DLQ for manual inspection" — the
-     developer chose the DLQ/safer path at that point.
-  2. Later, the developer asked directly: "why did we introduce a DLQ in
-     the first place?" This required retracing the conversation, since it
-     was easy to conflate with an EARLIER, separate discussion about
-     whether Mongo connection outages needed a DLX (dead letter exchange)
-     — that earlier discussion had already concluded NO, a simple
-     time-bounded retry sufficed for connection issues (see Decision 4).
-     The DLQ for malformed IDs was a distinct, later decision, solving a
-     different problem (poison messages, not outages) — this distinction
-     had gotten blurred in the developer's own recollection and needed to
-     be untangled explicitly.
-  3. Once re-traced, it became clear that connection-issue failures never
-     actually reach the DLQ at all (they retry-and-requeue within
-     updateDeliveryStatus itself); only the malformed-ID case does. This
-     prompted the follow-up question of what audit/debugging value a
-     DLQ full of malformed IDs would actually provide.
-  4. The answer arrived at: none, because these IDs originate from the
-     service's own database query, not external input — so a DLQ entry
-     represents an internal bug already, and the correct fix is to prevent
-     bad IDs from being generated/forwarded in the first place, not to
-     store them for later inspection.
-  5. This led directly to removing the DLQ and adding the upstream
-     validation-as-tripwire in processOfflineMessages.js instead — the
-     final architecture documented above.
+This is the decision I went back and forth on the most:
+  1. I built the DLQ first as "the safer option," choosing it directly over
+     just blindly discarding malformed IDs.
+  2. Later, I stopped and asked myself: why did I even introduce a DLQ in
+     the first place? I had to retrace my own reasoning, because I'd
+     conflated it with an EARLIER, separate decision about whether Mongo
+     connection outages needed a full DLX (dead letter exchange) — I'd
+     already concluded NO on that one, a simple time-bounded retry was
+     enough for connection issues (see Decision 4). The DLQ for malformed
+     IDs was a distinct, later decision solving a different problem
+     (poison messages, not outages), and I'd blurred the two together in my
+     own head.
+  3. Once I untangled that, it became clear connection-issue failures never
+     actually reach the DLQ at all — they retry-and-requeue right inside
+     updateDeliveryStatus. Only the malformed-ID case ever lands there.
+     That made me ask what audit/debugging value a DLQ full of malformed
+     IDs would actually give me.
+  4. The answer: none, because these IDs come from my own database query,
+     not external input — so a DLQ entry already represents an internal
+     bug, and the real fix is to stop bad IDs from being generated or
+     forwarded in the first place, not to store them for later.
+  5. That led directly to removing the DLQ and adding upstream validation-
+     as-tripwire in processOfflineMessages.js instead — the final
+     architecture documented above.
 
-This is a genuine example of "changed direction because we pondered a new
-angle on the problem" — the DLQ wasn't wrong given the information at the
-time it was built (defensive, matched the "safer" choice explicitly
-requested), but re-examining the actual data flow revealed it added
-complexity without adding real protection, and the fix belonged one layer
-upstream instead.
+This is a genuine example of changing direction because I looked at the
+problem from a new angle, not because the first version was wrong given
+what I knew at the time. The DLQ was a reasonable, defensive choice when I
+built it — re-examining the actual data flow later is what showed me it
+added complexity without adding real protection, and that the fix belonged
+one layer upstream instead.
 
 ================================================================================
 DECISION 7 — Sender Delivery Notification (Best-Effort, Fire-and-Forget)
 ================================================================================
-New file involved: notifySenderDelivered.js (main service — receives
-delivery confirmations, emits to sender's socket if online)
+New file: notifySenderDelivered.js (main service — receives delivery
+confirmations, emits to the sender's socket if they're online)
 
 PURPOSE
 When a message was sent while the recipient was offline, and the recipient
 later comes online and receives it (Lanes 1-3 completing), the ORIGINAL
-SENDER has no way to find out in real time — their UI stays showing "sent"
-(single tick) even though the message has genuinely been delivered
-(should be double tick). This decision closes that gap.
+SENDER has no way to find out in real time — their UI keeps showing "sent"
+(single tick) even though the message has genuinely been delivered (should
+be double tick). This decision closes that gap.
 
-Scope was deliberately narrowed during discussion: this notification is
-ONLY needed for the delayed-delivery path (recipient was offline at send
-time). The synchronous online-send path, in the existing
+I narrowed the scope on this one after re-checking my own code: this
+notification is ONLY needed for the delayed-delivery path (recipient
+offline at send time). The synchronous online-send path, in my existing
 `getthesocketID-forMessage` socket handler, already sets
 `message.status = "delivered"` immediately via `emitWithAck` if the
-recipient is online at send time — the sender already learns this
-synchronously, in the same request/callback. No gap existed there; it was
-initially assumed to be part of the same missing feature and was corrected
-mid-discussion by re-reading the existing socket handler code.
+recipient is online at send time — the sender already learns that
+synchronously, in the same callback. I'd initially assumed that path had the
+same gap and had to go re-read my own handler to confirm it didn't.
 
 PROBLEM
-updateDeliveryStatus.js (Decision 6's final form) updates MongoDB and
-stops. It has no mechanism to reach a live socket connection, because
-`io` (the Socket.IO server instance) exists only in the MAIN service
-process — updateDeliveryStatus.js runs in the separate MESSAGE service
-process, which has no access to `io` at all.
+updateDeliveryStatus.js (Decision 6's final form) updates MongoDB and stops.
+It has no way to reach a live socket connection, because `io` (the
+Socket.IO server instance) only exists in the MAIN service process —
+updateDeliveryStatus.js runs in the separate MESSAGE service process, which
+has no access to `io` at all.
 
-Additionally, `updateMany` alone cannot supply what's needed to notify
-anyone: it returns only a match/modify count summary, never the actual
-updated documents. A genuine misunderstanding surfaced and was corrected
-during design: `updateMany` does NOT return document fields like
-`senderID` — a separate query is unavoidably required to obtain sender
-information, regardless of design choice.
+On top of that, `updateMany` alone can't give me what I need to notify
+anyone — it only returns a match/modify count summary, never the actual
+updated documents. I briefly assumed I could get sender IDs straight out of
+`updateMany`, and had to correct myself: it doesn't return document fields
+like `senderID` at all. A separate query is unavoidable to get sender
+information, no matter which order I run things in.
 
 SOLUTION
-Cross-process design, following the RabbitMQ RPC pattern already
-established for Lanes 1-3, but INTENTIONALLY SIMPLER — fire-and-forget,
-no reply queue needed, since the message service does not need
-confirmation that a sender was successfully notified:
+Cross-process design, following the same RabbitMQ RPC pattern I already
+built for Lanes 1-3, but INTENTIONALLY SIMPLER — fire-and-forget, no reply
+queue needed, since the message service doesn't need confirmation that a
+sender was successfully notified:
 
-1. In updateDeliveryStatus.js (message service), AFTER `updateMany`
-   succeeds:
+1. In updateDeliveryStatus.js, AFTER `updateMany` succeeds:
    - `messagedb.find({_id: {$in: ids}}, {senderID: 1})` — a second,
-     necessary query to obtain sender IDs for the just-updated messages.
-   - Group message IDs by sender (`bySender` object) so a batch of
+     necessary query to get sender IDs for the messages I just updated.
+   - Group message IDs by sender (`bySender` object), so a batch of
      multiple delivered messages from different senders produces ONE
      notification per sender, not one per message.
    - For each sender, `channel.sendToQueue("notifySenderDelivered",
-     {senderId, messageIds})` — fire-and-forget, no publisher confirms
-     (see rationale below).
+     {senderId, messageIds})` — fire-and-forget, no publisher confirms (see
+     below for why).
 
-2. New file, notifySenderDelivered.js, runs in the MAIN service (has
-   access to `io`). Consumes `notifySenderDelivered`, looks up the
-   sender's live socket via the SAME Redis pattern already used
-   elsewhere in the codebase (`redis.hGet(\`socket:${senderId}\`,
-   "socket")`), and if a socket ID is found, emits
-   `messagesDelivered` to it. If the sender is offline at this moment,
-   the notification is silently dropped — no fallback, no queued
-   retry-on-reconnect mechanism. This was a deliberate choice: MongoDB
-   already holds the correct "delivered" status by the time this step
-   runs, so a dropped live notification only delays the sender seeing
-   the double-tick until their next reload/reconnect. No data loss,
-   no incorrect state — purely a missed real-time UX update.
+2. New file, notifySenderDelivered.js, runs in the MAIN service where `io`
+   actually exists. It consumes `notifySenderDelivered`, looks up the
+   sender's live socket via the same Redis pattern I already use elsewhere
+   (`redis.hGet(\`socket:${senderId}\`, "socket")`), and if a socket ID
+   comes back, emits `messagesDelivered` to it. If the sender's offline at
+   that moment, I drop the notification silently — no fallback, no queued
+   retry-on-reconnect. Deliberate: MongoDB already has the correct
+   "delivered" status by this point, so a dropped live notification just
+   delays the sender seeing the double-tick until their next reload or
+   reconnect. No data loss, no incorrect state — just a missed real-time
+   UX update.
 
-3. Ordering decision — Option A vs Option B: Two candidate orderings
-   were compared for step 1 above:
+3. Ordering — I compared two options for step 1:
      Option A: updateMany FIRST, then find senderIDs.
      Option B: find senderIDs FIRST, then updateMany.
-   Both cost the SAME number of DB round-trips (two queries, either
-   order) — an initial assumption that Option B was more efficient
-   (fewer round trips) was raised and corrected: it is not, the round-trip
-   count is identical either way. The deciding factor became correctness
-   under partial failure: Option A guarantees you never fetch/act on
-   sender data for an update that did not actually persist. Option B risks
-   holding sender data in hand while the subsequent updateMany could still
-   fail, creating a path to falsely notifying a sender about a delivery
-   that never actually completed in the DB. Option A was chosen for this
-   reason, not for efficiency.
+   I initially assumed Option B saved a round-trip and was wrong — both
+   options cost the exact same two queries, just in a different order. The
+   real deciding factor turned out to be correctness under partial failure:
+   Option A guarantees I never fetch or act on sender data for an update
+   that didn't actually persist. Option B risks holding sender data in hand
+   while the subsequent updateMany could still fail — which opens a path to
+   falsely telling a sender their message was delivered when the DB update
+   never actually went through. I picked Option A for that reason, not for
+   efficiency.
 
-4. No publisher confirms on the `notifySenderDelivered` send. Explicitly
-   discussed and rejected: since the underlying "delivered" status is
-   ALREADY safely persisted in MongoDB by the time this fire-and-forget
-   send happens, the notification itself is best-effort UX polish, not a
-   correctness-critical guarantee. The narrow failure window this would
-   protect against (RabbitMQ specifically unreachable in the same instant
-   MongoDB was confirmed reachable) was judged too rare and too low-stakes
-   (worst case: a live UI update arrives late instead of not at all) to
-   justify the added complexity of confirm-mode channels and failure
-   handling for this specific step.
+4. No publisher confirms on the `notifySenderDelivered` send. I thought
+   about adding them and decided against it: the underlying "delivered"
+   status is ALREADY safely persisted in MongoDB by the time this fire-and-
+   forget send happens, so the notification itself is best-effort UX
+   polish, not a correctness-critical guarantee. The narrow failure window
+   this would protect against — RabbitMQ specifically unreachable in the
+   same instant MongoDB was confirmed reachable — felt too rare and too
+   low-stakes (worst case: a live UI update arrives late instead of not at
+   all) to justify the added complexity of confirm-mode channels and
+   failure handling for this one step.
 
 5. Where the new one-time consumer gets started: NOT inside the per-socket
    connection handler (socket.js) — that file runs on EVERY single client
    connection, and registering a new `channel.consume(...)` there would
-   create a duplicate, growing set of competing consumers on the same
-   queue, one per connection ever made. Placed instead in the main
-   service's index.js, inside the `server.listen(...)` startup callback,
+   create a growing pile of duplicate, competing consumers on the same
+   queue, one per connection ever made. I put it in the main service's
+   index.js instead, inside the `server.listen(...)` startup callback,
    alongside the existing one-time `Rabbit_MQ_connection()` call — the
-   correct category is "long-lived listener, starts once at process boot"
-   (same category as MarkDelivery/updateDeliveryStatus in the message
-   service), not "per-event action" (the correct category for the
-   existing sendToQueue calls already living in socket.js).
+   right category is "long-lived listener, starts once at process boot"
+   (same category MarkDelivery/updateDeliveryStatus fall into on the
+   message-service side), not "per-event action" (the right category for
+   the sendToQueue calls already living in socket.js).
 
-`io` is passed into notifySenderDelivered(io) as an explicit function
-argument at this startup call site, NOT re-imported by having
-notifySenderDelivered.js require index.js back (index.js does
-`module.exports = io`, which technically could be required elsewhere) — a
-circular-import approach was considered, specifically to reduce code
-added to index.js, and rejected: the actual code-volume difference between
-"pass io as an argument" and "import io back circularly" was determined to
-be a single word/argument, not a meaningful reduction, while the circular
-version reintroduces real require-order fragility for no benefit.
+I pass `io` into notifySenderDelivered(io) as an explicit function argument
+at that startup call site, rather than having notifySenderDelivered.js
+require index.js back to grab `io` from its exports (index.js does
+`module.exports = io`, which technically could be required elsewhere). I
+considered the circular-import route specifically to keep index.js shorter,
+and dropped it once I actually compared the code volume — passing `io` as
+an argument versus importing it circularly comes out to basically one word
+of difference, not a meaningful reduction, while the circular version
+reintroduces real require-order fragility for nothing in return.
 
 HISTORY
-Several points of confusion were corrected during design, each worth
-recording because they reflect genuine reasoning corrections, not just
-implementation steps:
-  1. Initial framing of "what's left" conflated this feature with an
-     unrelated open item (prefetch on MarkDelivery) — corrected when
-     asked directly to separate "what's left in the offline-delivery
-     FEATURE" from "what's left in the conversation generally." These are
-     two different lists; prefetch does not belong under this feature.
-  2. A misunderstanding that `updateMany` could itself return the sender
-     IDs (since it "gets you the exact message docs") was corrected —
-     `updateMany`'s return value is a summary object only, never document
-     fields. This directly shaped why a second `find` query is
-     unavoidable regardless of ordering choice.
-  3. An initial belief that Option B (find-then-update) reduced DB
-     round-trips compared to Option A was corrected — both cost the same
-     two queries; the real distinguishing factor is correctness under
-     partial failure, not efficiency, and Option A was chosen on that
-     basis.
-  4. A term-precision correction: the developer asked whether this
-     ordering decision was "CAP theorem consistency" — clarified that CAP
-     theorem concerns distributed/replicated storage under network
-     partition, which is a different problem than this single-database,
-     sequential-operations ordering concern. Closer analogy offered:
-     causal ordering / write-then-read consistency within a sequence, not
-     CAP's C.
-  5. Whether to add publisher confirms on the `notifySenderDelivered` send
-     was explicitly asked and directly answered NO, with reasoning tied
-     back to the feature's already-established best-effort nature (see
-     solution point 4 above) — this was a deliberate scope boundary, not
-     an oversight.
-  6. Deferred, explicitly, by direct developer request, NOT forgotten:
+A few points I got wrong or conflated along the way, worth keeping on
+record because they're genuine reasoning corrections, not just
+implementation notes:
+  1. I initially lumped "what's left on this feature" together with an
+     unrelated open item (prefetch on MarkDelivery) — caught myself and
+     separated "what's left in the offline-delivery FEATURE" from "what's
+     generally still open" as two different lists. Prefetch doesn't belong
+     under this feature.
+  2. I assumed `updateMany` could hand me the sender IDs directly (since it
+     "gets you the exact message docs" — it doesn't). Correcting that
+     directly shaped why a second `find` query is unavoidable no matter
+     which ordering I chose.
+  3. I assumed Option B (find-then-update) saved a round-trip over Option A
+     — wrong, both cost the same two queries. The real distinguishing
+     factor is correctness under partial failure, not efficiency, and
+     that's what actually decided it.
+  4. I asked myself whether this ordering decision was "CAP theorem
+     consistency" and had to correct my own terminology — CAP theorem is
+     about distributed/replicated storage under a network partition, a
+     different problem from this single-database, sequential-operations
+     ordering concern. The closer fit is causal ordering / write-then-read
+     consistency within a sequence, not CAP's C.
+  5. I explicitly decided against publisher confirms on the
+     `notifySenderDelivered` send, tying that decision back to the
+     feature's already-established best-effort nature (see solution point
+     4 above) — a deliberate scope boundary, not something I overlooked.
+  6. Deliberately deferred, not forgotten:
      - Proper Redis error handling inside notifySenderDelivered.js (a
-       thrown/rejected `redis.hGet` currently falls into a broad catch
-       that nack-discards without distinguishing transient-vs-permanent,
-       unlike the more careful error categorization built for Decision 4).
-     - The two React frontend gaps (see STILL OPEN below) were
-       intentionally sequenced AFTER this backend feature was finished,
-       per explicit developer instruction, not because they were
-       considered lower priority in an absolute sense.
+       thrown/rejected `redis.hGet` currently falls into a broad catch that
+       nack-discards without distinguishing transient from permanent,
+       unlike the more careful categorization I built for Decision 4).
+     - The two React frontend gaps (below) were intentionally sequenced
+       AFTER this backend feature, by my own choice — not because I
+       consider them lower priority in any absolute sense, just ordering.
 
 ================================================================================
 STILL OPEN / NOT YET BUILT (as of this document)
 ================================================================================
 
-- Frontend: OfflineMessages socket callback (client-side) currently has
-  no real error handling — it unconditionally calls `callback(true)` for
+- Frontend: my OfflineMessages socket callback (client-side) has no real
+  error handling right now — it unconditionally calls `callback(true)` for
   every received offline message regardless of whether the message was
-  actually processed/rendered successfully client-side. Flagged directly
-  by the developer as needing a fix, explicitly deferred until backend
-  work (Decision 7 and beyond) is complete.
+  actually processed or rendered successfully on the client. I flagged this
+  myself as needing a fix, deliberately deferred until the backend work
+  above (Decision 7 and earlier) was done.
 
-- Frontend: single/double/blue tick UI logic is not yet built at all —
-  the backend now emits a `messagesDelivered` event (Decision 7) but
-  nothing on the client currently listens for it or updates message
-  state/UI based on it.
+- Frontend: single/double/blue tick UI logic isn't built yet at all — the
+  backend now emits a `messagesDelivered` event (Decision 7) but nothing on
+  the client listens for it or updates message state/UI based on it.
 
-- Redis error handling inside notifySenderDelivered.js: currently any
-  error (including a Redis connection failure) falls into a single catch
-  that nack-discards without retry, unlike the careful
-  transient-vs-permanent categorization built for MarkDelivery.js
-  (Decision 4). Explicitly deferred by direct developer request, to be
-  revisited after the two frontend items above are done.
+- Redis error handling inside notifySenderDelivered.js: right now any
+  error, including a Redis connection failure, falls into a single catch
+  that nack-discards without retry, unlike the careful transient-vs-
+  permanent categorization I built for MarkDelivery.js (Decision 4).
+  Deliberately deferred, to revisit after the two frontend items above.
 
-- No prefetch value set on MarkDelivery's channel: currently unbounded
-  (RabbitMQ/amqplib default). This means a burst of simultaneous
-  reconnects (e.g. after a server restart) could hand this one consumer
-  a large number of unacked messages at once, all potentially retrying
-  MongoDB concurrently if an outage coincides with such a burst. Discussed
-  at length (including a genuine correction of an earlier, real
-  misunderstanding: prefetch(1) is a THROTTLE ON THE WHOLE CONSUMER, not a
-  per-user lock — it does not prevent same-user duplicate-reconnect races
-  the way it might appear to at first glance) but left as an open decision,
-  not yet applied. This is UNRELATED to the offline-delivery feature
-  itself and should not be conflated with it (see Decision 7 History,
-  point 1).
+- No prefetch value set on MarkDelivery's channel — currently unbounded
+  (RabbitMQ/amqplib default). A burst of simultaneous reconnects (say,
+  after a server restart) could hand this one consumer a large number of
+  unacked messages at once, all potentially retrying MongoDB concurrently
+  if an outage coincides with a burst like that. I looked into this at
+  length, including catching a real misunderstanding of my own: prefetch(1)
+  throttles the WHOLE consumer, not a per-user lock — it doesn't actually
+  prevent same-user duplicate-reconnect races the way I first assumed it
+  did. Left as an open decision, not yet applied. Unrelated to the offline-
+  delivery feature itself — see history point 1 under Decision 7.
 
-- A bug was reported by the developer at the very end of this session
-  ("there is an issue in the feature") but had not yet been diagnosed or
-  described in enough detail to document at the time this entry was
-  written. The developer was mid-debugging, isolating which stage of the
-  pipeline it occurs at, when the conversation moved to closing out this
-  document ahead of switching to a new chat. THIS IS A KNOWN LOOSE END —
-  whoever picks this up next (a future Claude session, or the developer
-  themself) should ask what this issue was and whether it was resolved,
-  since it may affect confidence in Decision 7's correctness as documented
-  above. Decision 7 above describes the DESIGN as agreed upon, not
-  necessarily a design that has been confirmed bug-free in practice.
+- I found a bug in this feature while testing it, near the end of the
+  session I was documenting from, and hadn't yet diagnosed or described it
+  in enough detail to write it up properly here. I was mid-debugging,
+  isolating which stage of the pipeline it's coming from, when I moved to
+  closing this document out ahead of switching to a fresh session. THIS IS
+  A KNOWN LOOSE END — next time I pick this up, first thing is to nail down
+  what that bug actually was and whether I've fixed it, since it affects
+  how much I should trust Decision 7 as documented above. Decision 7
+  describes the DESIGN I agreed to build, not necessarily a design I've
+  confirmed is bug-free in practice yet.
 
 ================================================================================
 End of document.

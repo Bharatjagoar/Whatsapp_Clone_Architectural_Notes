@@ -476,47 +476,177 @@ implementation notes:
        consider them lower priority in any absolute sense, just ordering.
 
 ================================================================================
-STILL OPEN / NOT YET BUILT (as of this document)
+================================================================================
+DECISION 8 — notifySenderDelivered.js: Stale-Socket Check and Payload
+Validation
 ================================================================================
 
-- Frontend: my OfflineMessages socket callback (client-side) has no real
-  error handling right now — it unconditionally calls `callback(true)` for
-  every received offline message regardless of whether the message was
-  actually processed or rendered successfully on the client. I flagged this
-  myself as needing a fix, deliberately deferred until the backend work
-  above (Decision 7 and earlier) was done.
+PURPOSE
+Decision 7's sender-notification design had gone untested for a real bug
+found during use, not yet diagnosed. Tracing it down: two independent
+problems, both in notifySenderDelivered.js.
 
-- Frontend: single/double/blue tick UI logic isn't built yet at all — the
-  backend now emits a `messagesDelivered` event (Decision 7) but nothing on
-  the client listens for it or updates message state/UI based on it.
+PROBLEM
+1. The emit relied on Redis alone (`if (socketId) { io.to(socketId).emit(...) }`)
+   to decide whether the sender was reachable. Redis having an entry
+   doesn't mean the socket is actually live — a disconnect that doesn't
+   fire cleanly (crash, dropped network, no close frame) leaves a stale
+   entry behind, and `io.to(deadSocketId).emit(...)` doesn't throw, it
+   just emits into nothing. The log line said "notified sender"
+   unconditionally based on Redis having a socketId, not on whether anyone
+   actually received it.
+2. No validation that `messageIds` was actually an array before calling
+   `.length` on it. A malformed payload would throw mid-handler, after the
+   (bad) emit had already fired, get misclassified as a non-connection
+   error, and get permanently discarded.
 
-- Redis error handling inside notifySenderDelivered.js: right now any
-  error, including a Redis connection failure, falls into a single catch
-  that nack-discards without retry, unlike the careful transient-vs-
-  permanent categorization I built for MarkDelivery.js (Decision 4).
-  Deliberately deferred, to revisit after the two frontend items above.
+SOLUTION
+1. Array check first, before touching anything else in the payload —
+   fails closed with a clear log line if `messageIds` isn't an array,
+   before the Redis lookup or the emit ever run.
+2. Stale-socket check using Socket.IO's own live-socket registry instead
+   of trusting Redis alone:
+       if (socketId && io.sockets.sockets.get(socketId)) {
+         io.to(socketId).emit("messagesDelivered", { chatId, messageIds });
+       } else if (socketId) {
+         // stale Redis entry — DB status is already correct, skip
+       } else {
+         // genuinely offline
+       }
+   `io.sockets.sockets.get(socketId)` checks the actual in-memory registry
+   on this server instance — the difference between "Redis says this ID
+   exists" and "this ID is a real, currently-connected client."
 
-- No prefetch value set on MarkDelivery's channel — currently unbounded
-  (RabbitMQ/amqplib default). A burst of simultaneous reconnects (say,
-  after a server restart) could hand this one consumer a large number of
-  unacked messages at once, all potentially retrying MongoDB concurrently
-  if an outage coincides with a burst like that. I looked into this at
-  length, including catching a real misunderstanding of my own: prefetch(1)
-  throttles the WHOLE consumer, not a per-user lock — it doesn't actually
-  prevent same-user duplicate-reconnect races the way I first assumed it
-  did. Left as an open decision, not yet applied. Unrelated to the offline-
-  delivery feature itself — see history point 1 under Decision 7.
+Known accepted limitation: this check only knows about sockets connected
+to THIS process. Correct at single-instance scale; would need liveness
+tracked in Redis itself (e.g. a TTL'd heartbeat) instead of an in-memory
+check if this ever runs across multiple instances.
 
-- I found a bug in this feature while testing it, near the end of the
-  session I was documenting from, and hadn't yet diagnosed or described it
-  in enough detail to write it up properly here. I was mid-debugging,
-  isolating which stage of the pipeline it's coming from, when I moved to
-  closing this document out ahead of switching to a fresh session. THIS IS
-  A KNOWN LOOSE END — next time I pick this up, first thing is to nail down
-  what that bug actually was and whether I've fixed it, since it affects
-  how much I should trust Decision 7 as documented above. Decision 7
-  describes the DESIGN I agreed to build, not necessarily a design I've
-  confirmed is bug-free in practice yet.
+================================================================================
+DECISION 9 — Bounded Retry on Transient Redis Failures (notifySenderDelivered.js)
+================================================================================
+
+PURPOSE
+notifySenderDelivered.js depends on a Redis lookup (`redis.hGet`) to find
+the sender's socket before it can emit anything. That lookup can fail if
+Redis is briefly unreachable — the same category of problem Decision 4
+solves for MongoDB, applied here to Redis.
+
+PROBLEM
+A Redis connection blip and a genuinely unrecoverable error were being
+treated the same way: any error discarded the notification outright. A
+one-second Redis hiccup shouldn't cost a sender their live delivery
+notification when a short retry would very likely succeed.
+
+SOLUTION
+Same shape as Decision 4, applied to Redis's own error classes instead of
+Mongo's: `ClientClosedError`, `SocketClosedUnexpectedlyError`, and
+`ConnectionTimeoutError` are treated as transient — retried once a second
+for up to 5 seconds before giving up. Anything else is treated as
+permanent and discarded immediately, no retry.
+
+Each retry re-runs the full lookup-and-emit sequence, not just the Redis
+call in isolation — meaning Decision 8's stale-socket check runs again on
+every retry attempt, not only on the first try. A retry that succeeds in
+reconnecting to Redis still has to pass the same "is this socket actually
+live" check before anything gets emitted.
+
+If the full 5-second window elapses without success, the notification is
+dropped — deliberately, not a fallback failure. The underlying "delivered"
+status is already correct in MongoDB by this point (that write happens in
+updateDeliveryStatus.js, a separate step, before this notification is ever
+attempted); a dropped live notification here just delays the sender seeing
+the tick flip until their next reconnect, not a loss of data.
+
+================================================================================
+DECISION 10 — clientMessageId: Stable Client-Side Message Identity
+================================================================================
+
+PURPOSE
+The delivery-tick UI needs to flip a specific message from single-tick to
+double-tick when Decision 7's notification arrives. That requires an ID
+shared between what the sender's client has in its own state and what the
+backend reports as delivered. No such shared ID existed.
+
+PROBLEM
+The only ID the system had for a message was MongoDB's own `_id`, assigned
+at insert time in the message-service process. The sender's client shows a
+message optimistically before that insert happens, and the existing send
+flow's ack never returns the real `_id` — only `{ time, status }`. The
+sender's Redux copy of an outgoing message never had, and structurally
+could never get, the real database ID. Decision 7's `messagesDelivered`
+event arrives carrying real Mongo `_id`s — IDs the sender's own client has
+never seen. No match is possible.
+
+I considered generating the ID client-side and using it directly as `_id`.
+Rejected: `_id` carries a global-uniqueness contract MongoDB itself
+guarantees on auto-generated ObjectIds. A client-side generator has no
+visibility into the collection and can't safely make that same guarantee —
+a collision there is a hard insert failure over a field whose actual job is
+unrelated to what this needed.
+
+SOLUTION
+Added a separate field, `clientMessageId`, generated client-side via
+`crypto.randomUUID()` at message-composition time, before the message is
+sent. It travels with the message through the whole pipeline — attached at
+creation, persisted alongside the real `_id`, carried through the offline-
+delivery lanes, and used (instead of the real `_id`) in Decision 7's
+notification back to the sender. The reducer that flips a message's status
+matches on `clientMessageId`, the one ID guaranteed to exist on every
+outgoing message the sender's own client holds. Mongo's `_id` semantics
+stay completely untouched — this is an additional plain field, not a
+replacement.
+
+Schema field: `clientMessageId: { type: String, required: true }`.
+Required deliberately, so no future insert path can silently produce a
+message with no stable client-side identity.
+
+Verified this holds under reload: a message sent while the recipient is
+offline, followed by the sender reloading before the recipient comes back,
+still resolves correctly, because the conversation-history query has no
+field-projection restriction — `clientMessageId` comes back automatically
+along with everything else on reload, same as it would from live memory.
+
+================================================================================
+DECISION 11 — Bounded Retry on updateDeliveryStatus.js, With Requeue Instead
+of Discard on Final Failure
+================================================================================
+
+PURPOSE
+updateDeliveryStatus.js had no retry logic at all — any connection error
+nacked with an immediate requeue and no delay, unlike every other consumer
+in this pipeline (Decision 4's MongoDB retry pattern).
+
+PROBLEM
+Two separate issues. First, the missing retry itself: a Mongo blip during
+this step would either lose the update outright or, worse, requeue and
+immediately re-fail in a tight loop with no delay, hammering both RabbitMQ
+and Mongo during a real outage. Second, once retry logic was added, the
+final-failure behavior needed its own decision, because this consumer isn't
+like the others: it performs multiple sequential operations per message —
+the `updateMany` status write, then a `find` for sender IDs, then the
+notification send — where the earlier steps can succeed even if a later one
+fails. MarkDelivery.js and MessageSent.js each do one unit of work; this
+one doesn't.
+
+SOLUTION
+Same 1-second-interval, bounded-deadline retry pattern as Decision 4,
+applied to this consumer's Mongo calls. On final failure, though, the
+behavior is deliberately different: this file requeues instead of
+discarding. Reasoning: by the time this consumer might fail, `updateMany`
+may have already succeeded and the DB may already correctly say
+"delivered" — only the later notification step failed. Discarding at that
+point would mean the DB is right but the sender is never told, permanently,
+since nothing else re-triggers this notification path on its own.
+Requeuing costs nothing extra, since re-running `updateMany` on an
+already-"delivered" document is a no-op, and gives the notification step
+another chance to complete.
+
+Accepted risk: if the failure is something that can never succeed — not a
+transient blip but a structural problem — this creates a poison-message
+loop with no dead-letter exchange to catch it. A real gap, chosen
+deliberately over building DLX machinery for a single edge case at this
+project's current scale, not an oversight.
 
 ================================================================================
 End of document.

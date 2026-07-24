@@ -39,7 +39,7 @@ When a user is offline and receives a message, the message is stored with
 ## Decisions documented
 
 Full reasoning for each is in
-[`ChatMeSerivice_Offline_Delivery_Architecture.txt`](./ChatMeSerivice_Offline_Delivery_Architecture.txt).
+[`WhatsApp_Offline_Delivery_Architecture.txt`](./WhatsApp_Offline_Delivery_Architecture.txt).
 
 1. **Anonymous exclusive reply queues, one per request** — fixes a real
    race where a userid-keyed shared queue could hand one request's reply
@@ -57,9 +57,7 @@ Full reasoning for each is in
    up to 10 seconds before giving up cleanly.
 5. **Timeout on the waiting consumer** — without it, a crashed or
    never-replying message service would leave the main service's consumer
-   hanging forever. Also a case study in the gap between "this code was
-   written in conversation" and "this code is actually in the file" —
-   caught late, after an earlier false "done."
+   hanging forever.
 6. **Removed a Dead Letter Queue; moved validation upstream** — a DLQ was
    built first as "the safer option," then found to add no real value
    once traced through: the malformed IDs it would catch can only
@@ -73,21 +71,37 @@ Full reasoning for each is in
    underlying "delivered" status is already safely persisted in MongoDB
    before this step runs — a missed live notification is a delayed UI
    update, not a data-loss bug.
+8. **Stale-socket check and payload validation in `notifySenderDelivered.js`**
+   — a Redis entry existing doesn't mean the socket behind it is still
+   connected. Added a live-socket check against Socket.IO's own registry
+   instead of trusting Redis alone, plus array validation on the incoming
+   payload so a malformed message can't get misclassified as a connection
+   failure and silently discarded.
+9. **Bounded retry on transient Redis failures** — same shape as decision
+   4, applied to Redis instead of Mongo. A short Redis blip shouldn't cost
+   a sender their live delivery notification; a genuinely dead lookup
+   still fails fast.
+10. **`clientMessageId`** — a client-generated UUID that gives the sender's
+    own client a stable identity for a message before MongoDB's `_id`
+    exists yet, so the delivery-notification event (decision 7) can be
+    matched back to the right message in the sender's UI.
+11. **Bounded retry on `updateDeliveryStatus.js`, with requeue instead of
+    discard on final failure** — this consumer does multiple sequential
+    DB operations per message, so a late failure can leave the delivered
+    status already correctly written while only the notification step
+    failed. Requeuing (rather than discarding) gives that last step
+    another chance without any risk to already-correct data.
 
 ## Known open items
 
-- Frontend has no real error handling on the offline-messages receive
-  callback, and no UI logic yet for single/double-tick based on the new
-  `messagesDelivered` event.
-- Redis error handling inside `notifySenderDelivered.js` is currently
-  coarse (any error discards without distinguishing transient vs.
-  permanent) — deliberately deferred, not forgotten.
-- No `prefetch` set on the message service's consumer channel — unrelated
-  to this feature, but open.
-- **An unresolved bug was found in this feature during testing, in the
-  session this documentation was written from, and had not been diagnosed
-  before the session ended.** Treat the design above as *agreed upon*,
-  not yet *confirmed correct in practice*, until this is closed out.
+- Frontend has no delivery-tick UI polish yet — status-driven single/
+  double-tick rendering exists, but the visual pass (icons, layout) isn't
+  done.
+- No `prefetch` set on any of the message service's consumer channels —
+  unrelated to this feature specifically, but open.
+- `updateDeliveryStatus.js`'s requeue-on-final-failure (decision 11) has
+  no dead-letter mechanism behind it — a genuinely permanent failure
+  there would requeue indefinitely rather than fail cleanly.
 
 ## Why this repo exists
 

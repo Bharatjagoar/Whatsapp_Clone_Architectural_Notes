@@ -1,0 +1,155 @@
+================================================================================
+ChatMeSerivice — Read Status: Architecture Decision Log
+================================================================================
+Covers: Lane 1 (client request) → Lane 2 (mark read in Mongo) → Lane 3
+(notify sender). Three files involved:
+  - messagesController.js (MarkAsRead)  (main service — receives request, fires and forgets)
+  - updateReadStatus.js                 (message service — marks read in Mongo)
+  - notifySenderRead.js                 (main service — notifies sender's live socket)
+
+I'm logging each decision as: PURPOSE → PROBLEM → SOLUTION → HISTORY (where
+HISTORY only appears if I changed my mind after first implementing something).
+
+================================================================================
+DECISION 1 — Read Scope: Whole Conversation, Not Individual Messages
+================================================================================
+
+PURPOSE
+When a user opens a chat, the system needs to decide what "read" actually
+means — every unread message in that conversation, or specific messages
+individually.
+
+PROBLEM
+Delivered-status tracks individual message IDs, because delivery happens
+incrementally as messages get pushed to a reconnecting client one at a time.
+Read status doesn't have that same incremental shape — a user opening a
+chat doesn't read messages one at a time from the system's perspective, they
+open the whole conversation at once. Modeling read the same way as
+delivered — tracking individual message IDs through the whole pipeline —
+would mean the frontend needs to know the Mongo `_id` of every unread
+message before it can tell the backend anything. That ID isn't reliably
+available: messages that arrive while the recipient is already connected
+(live-send path) are pushed to the client before they're even persisted to
+Mongo, so the client only ever has `clientMessageId`, never the real `_id`,
+for that path.
+
+SOLUTION
+Read status is scoped to the whole conversation, not individual messages.
+The client sends `{ chatId, otherUserId }` — no message IDs at all — and
+the backend does:
+    updateMany(
+      { chatId, recieverID: receiverId, status: { $in: ["sent", "delivered"] } },
+      { $set: { status: "read" } }
+    )
+This sidesteps the missing-ID problem entirely, because the operation never
+needed message IDs in the first place. The tradeoff: this system cannot
+express "message 3 was read but message 4 wasn't" within an open
+conversation — opening the chat marks everything currently unread as read,
+which matches how the feature is actually used (nobody reads message 3 and
+not message 4 in a live chat window), but it's a real modeling choice, not
+a limitation I overlooked.
+
+The filter matches both `"sent"` and `"delivered"`, not `"delivered"`
+alone, deliberately. `"sent"` only means the message reached my server and
+got persisted — it says nothing about whether the recipient has actually
+seen it yet. A message can sit at `"sent"` in Mongo while the recipient has
+already visually seen it on their screen: `GET /getMessages/:chatId`
+(`loadConversationMessages`) reads straight from Mongo whenever a chat is
+opened, completely independent of whatever state the separate
+delivered-status pipeline has reached for that message. If the recipient
+opens the chat before delivered-status's own lanes have caught up and
+flipped that message to `"delivered"`, and the read filter only matched
+`"delivered"`, that message would be stuck — genuinely read by the user,
+but permanently ineligible to ever become `"read"` in the database, because
+nothing else re-triggers the delivered-status pipeline for it. Matching
+`"sent"` too means read-status doesn't have to wait on delivered-status
+winning a race it has no visibility into.
+
+================================================================================
+DECISION 2 — Transport: Direct Request, Not RabbitMQ RPC
+================================================================================
+
+PURPOSE
+Main service needs to tell message service "mark this conversation read,"
+and needs to know whether to notify the sender afterward. Every existing
+cross-service interaction in this project goes through RabbitMQ — either
+fire-and-forget (delivered-status's notification lanes) or full RPC with a
+reply queue (`ReadConvo`, `MarkDelivery`'s offline-messages fetch).
+
+PROBLEM
+Delivered-status genuinely needs message-queue coordination: a reconnecting
+client triggers a batch fetch from Mongo, that batch gets emitted to the
+client with an ack-timeout, and only messages the client actually
+acknowledges get marked delivered. That's multiple steps with real timing
+dependencies between two services, which is exactly what a queue is for.
+
+Read status has none of that shape. The user is provably already connected
+when they open a chat — there's no reconnect timing to coordinate, no batch
+to assemble, no ack-gating. It's a single synchronous action: "mark this
+read, tell me if anyone needs notifying." Routing it through a queue with
+its own consumer file, retry loop, and ack/nack handling would be copying
+the delivered-status pattern for structural reasons that don't actually
+apply here — the underlying problem the pattern exists to solve isn't
+present in this feature.
+
+There's also a real asymmetry in what failure costs here versus in
+delivered-status. If a delivered-status update is lost, the sender never
+finds out their message arrived — a real, permanent correctness gap unless
+something else re-triggers it. If a read-status update is lost or delayed,
+the chat just keeps showing "delivered" a little longer; the next time the
+recipient opens that same chat, the exact same mark-as-read request fires
+again and self-corrects. The stakes don't justify the same retry machinery.
+
+SOLUTION
+Main service's `MarkAsRead` handler responds to the client immediately —
+`res.status(200)` — without waiting on message service at all. The actual
+Mongo update happens via a still-async but directly-triggered lane
+(`updateReadStatus.js`), not a synchronous RPC-with-reply. If the update
+succeeds and something changed, that lane independently fires a second
+message to notify the sender (`notifySenderRead.js`) — structurally the
+same fire-and-forget notification shape delivered-status already uses for
+its own sender notification, just without the reconnect-coordination lane
+that precedes it in that pipeline.
+
+HISTORY
+I first assumed this should follow the same RPC-with-reply-queue pattern as
+`ReadConvo`, since that's the existing pattern for main-service-asks-
+message-service-something. Tracing through why `ReadConvo` actually needs
+that pattern — the client is waiting on real data (the messages
+themselves) — showed the reasoning didn't transfer: `MarkAsRead`'s client
+doesn't need anything back from message service to render correctly, so
+there was nothing to hold the HTTP response open for. Recognizing that the
+existing pattern's justification didn't apply here, rather than defaulting
+to it because it was already in the codebase, is what led to the
+fire-and-forget design instead.
+
+================================================================================
+DECISION 3 — Trust Boundary: Client-Supplied ID for Routing, Server-Verified
+ID for Authorization
+================================================================================
+
+PURPOSE
+`notifySenderRead.js` needs to know which user's socket to look up in Redis
+so it can emit the live "read" event. That means main service needs an
+identity from somewhere at the point the client's request comes in.
+
+PROBLEM
+Two different IDs are involved in a single `MarkAsRead` request, and they
+carry very different consequences if wrong or spoofed:
+  - `receiverId` — whose messages get mutated to `status: "read"` in Mongo.
+  - `otherUserId` — whose socket gets looked up and notified live.
+If both were taken from the client's request body, a client could claim to
+be a different user entirely and mark someone else's received messages as
+read — a real authorization bypass, not just a display glitch.
+
+SOLUTION
+Only `receiverId` is treated as authoritative, and it's never read from the
+request body — it comes from `req.user.id`, populated by `verifyJWT` from a
+server-signed, server-verified token. The Mongo mutation is scoped to this
+value alone. `otherUserId`, by contrast, is accepted directly from the
+client, because the only thing it's used for is a Redis lookup and a socket
+emit — if a client sent a wrong or malicious value here, the worst outcome
+is a notification going to the wrong (or no) socket. It can't cause a
+mutation to data belonging to a user who didn't authorize it. Same request,
+two identity fields, two different trust levels, because the two fields
+carry two different blast radii.

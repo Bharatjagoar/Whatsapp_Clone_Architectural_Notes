@@ -1,7 +1,7 @@
-# ChatMeSerivice — Message Read Status
+# ChatMeService — Message Read Status
 
 Architecture notes for the read-status (blue tick) feature in
-[ChatMeSerivice](https://github.com/Bharatjagoar/ChatMeSerivice), a
+[ChatMeService](https://github.com/Bharatjagoar/ChatMeService.git), a
 WhatsApp-clone backend built on Node.js, Socket.IO, Redis, RabbitMQ, and
 MongoDB, split across a main service and a message service.
 

@@ -1,5 +1,5 @@
 ================================================================================
-ChatMeSerivice — Read Status: Architecture Decision Log
+ChatMeService — Read Status: Architecture Decision Log
 ================================================================================
 Covers: Lane 1 (client request) → Lane 2 (mark read in Mongo) → Lane 3
 (notify sender). Three files involved:

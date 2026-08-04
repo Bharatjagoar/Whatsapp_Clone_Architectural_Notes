@@ -1,6 +1,6 @@
 # Architecture Decisions
 
-Engineering decision logs for ChatMeSerivice, a WhatsApp-clone backend
+Engineering decision logs for ChatMeService, a WhatsApp-clone backend
 (Node.js, Socket.IO, Redis, RabbitMQ, MongoDB). Each feature gets its own
 folder: a short README summarizing the decisions, and a full write-up of
 the reasoning behind each one — including the wrong turns that got

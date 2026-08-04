@@ -1,5 +1,5 @@
 ================================================================================
-ChatMeSerivice — Offline Message Delivery: Architecture Decision Log
+ChatMeService — Offline Message Delivery: Architecture Decision Log
 ================================================================================
 Covers: Lane 1 (enqueue request) → Lane 2 (fetch offline messages) → Lane 3
 (confirm delivery status). Three files involved:

@@ -1,0 +1,259 @@
+================================================================================
+ChatMeService — Group Chat: Architecture Decision Log
+================================================================================
+Covers: group creation, membership presence, message ordering, send/fan-out,
+and read tracking. Files involved:
+  - groupController.js / groupRoute.js  (main — POST /group/create)
+  - CreateGroup.js                      (message service — persists Group)
+  - processGroupMemberships.js          (main — RPC on connect)
+  - GetUserGroups.js                    (message service — answers membership RPC)
+  - GroupSeqCounter.js                  (message service — atomic per-group seq)
+  - SendGroupMessage.js + socket.js's sendGroupMessage handler
+    (message service write + main service fan-out)
+  - GroupReadState.js + socket.js's markGroupRead handler
+    (message service write, fire-and-forget from main)
+
+I'm logging each decision as: PURPOSE → PROBLEM → SOLUTION → HISTORY (where
+HISTORY only appears if I changed my mind after first implementing something).
+
+================================================================================
+DECISION 1 — Message Ordering: Atomic Per-Group Sequence Counter, Not
+Mongo _id or Timestamp
+================================================================================
+
+PURPOSE
+Group read receipts need messages in a definite order — "read up to here"
+only means something if every client and the server agree on what "here" is.
+
+PROBLEM
+In a group with concurrent senders, Mongo's `_id` insertion order and each
+client's rendered order can disagree. Two members sending near-simultaneously
+can land in the DB in one order while a third member's client renders them
+in a different order, because delivery timing and DB write timing aren't the
+same thing. If read status is built on an order nobody actually agrees on,
+the read pointer becomes meaningless — it can mark a message "read" that a
+specific client never actually saw, or vice versa.
+
+SOLUTION
+Every group gets a `GroupSeqCounter` document (`{ groupId, currentSeq }`).
+Every message gets a `seq` stamped via:
+    findOneAndUpdate({ groupId }, { $inc: { currentSeq: 1 } }, { upsert: true })
+`$inc` inside a single-document `findOneAndUpdate` is atomic in Mongo by
+design — two concurrent increments can't both read the same starting value,
+because the read-and-add happens inside one indivisible database step.
+Compare to the naive version — read current max, add 1 in application code,
+then save — which is three separate steps with room for two concurrent
+requests to both read 47 and both compute 48. `$inc` collapses that into one
+step. `seq` is fixed on the message at creation and never updated again;
+`GroupReadState.lastReadSeq` is a separate, directly-set pointer field, not
+incremented — the two are easy to conflate since both involve a "current
+number" but they're different mechanisms solving different problems.
+
+The concurrency risk here isn't hypothetical for this codebase specifically:
+other consumers in this project already run with `prefetch(10)`, meaning
+multiple messages can be mid-processing at once even on a single consumer
+instance. A message queue guarantees delivery order to a consumer; it does
+not guarantee the consumer processes messages one at a time. Prefetch > 1
+(or multiple consumer instances) reopens exactly the race `$inc` closes.
+
+================================================================================
+DECISION 2 — Read Model: Pointer (lastReadSeq), Not Per-Message Read Records
+================================================================================
+
+PURPOSE
+Track which messages each group member has read, without the storage cost
+of a per-message-per-user record in a group that could have many members
+and many messages.
+
+PROBLEM
+Two ways to model "read": (a) one pointer per (user, group) — "read
+everything up to seq N" — or (b) one record per (user, message) — exact,
+but O(members x messages) storage instead of O(members).
+
+SOLUTION
+Went with the pointer: `GroupReadState { userId, groupId, lastReadSeq }`,
+one document per member per group, direct `$set` (never incremented) to the
+highest `seq` the user has actually had rendered in their viewport. A
+message counts as read if `seq <= lastReadSeq`.
+
+This is a deliberate, named tradeoff, not an oversight: the pointer model
+cannot represent "read with holes" — if a message renders out of order or
+fails to render once (say `seq 48` is skipped but `50` renders and gets
+read), the pointer still jumps to 50, and 48 is marked read even though it
+was never actually seen. This is permanent, not self-healing on
+re-render — once the pointer has passed a `seq`, nothing re-checks it,
+because the client only compares "is this seq below my line," not "did I
+specifically see this one." WhatsApp/Telegram accept this same inaccuracy
+for the same reason: chat is read top-to-bottom in practice, the failure
+case is rare, and the cost of being wrong is a slightly-optimistic blue
+tick, not lost data. Per-message tracking (option b) is strictly more
+correct but wasn't justified at this cost for this use case.
+
+================================================================================
+DECISION 3 — Read-Mark Transport: Fire-and-Forget, Not RPC
+================================================================================
+
+PURPOSE
+The client needs to tell the backend "I've read up to seq N" every time a
+message enters the viewport — a high-frequency event compared to sending a
+message or creating a group.
+
+PROBLEM
+Group message send (Decision 4) needs an RPC, because the client needs
+`seq` back before it can be a coherent event to display. Read-marking has
+no equivalent dependency — the marking client doesn't need anything back
+to render correctly; only *other* users' UIs change (their view of this
+user's blue tick), and not synchronously.
+
+SOLUTION
+`markGroupRead` is a plain fire-and-forget socket event: main service
+publishes to a queue and returns immediately, no reply queue, no callback
+the client waits on. The message-service consumer (`MarkGroupRead.js`) does
+a single write attempt with ack/nack on the queue itself — no manual retry
+loop, unlike the write-paths in Decisions 4 and 5.
+
+This is justified by the same self-healing property from Decision 2: if a
+read-mark write is lost, `lastReadSeq` simply doesn't advance yet. The
+moment the user reads anything past that point, the next `markGroupRead`
+call for a higher `seq` overwrites and effectively repairs the missed one
+for free, since the pointer only advances forward. The cost of a dropped
+write here is a few seconds of a stale blue tick, self-corrected by the
+user's own next scroll — nowhere near the cost of a dropped message
+(Decision 4) or a duplicated write (Decision 5), so the retry/ack machinery
+those need wasn't justified here.
+
+================================================================================
+DECISION 4 — Group Send: RPC-and-Wait, Not Fire-and-Forget Like 1:1
+================================================================================
+
+PURPOSE
+A sent group message needs to reach online members in real time and be
+persisted with the correct `seq`.
+
+PROBLEM
+1:1 send (`getthesocketID-forMessage`) is fire-and-forget: the socket
+handler emits to the receiver using data it already owns (Redis lookup),
+then separately queues persistence with nothing waiting on it — emit and
+persist are fully decoupled, and persistence completing late changes
+nothing about what already got sent.
+
+Group send doesn't have that freedom, because of Decision 1: every
+recipient needs to receive a message that already carries its correct
+`seq`, and `seq` only exists once `GroupSeqCounter`'s `$inc` has actually
+run in message service's database. Main service has no way to fabricate or
+guess `seq` locally — it's cross-service state by construction, since
+`Group`/`GroupSeqCounter`/`GroupMessage` all live in message service's
+Mongo connection for the reason covered in Decision 6.
+
+I considered emitting optimistically (some client-derived ordering, patch
+`seq` in after the RPC resolves) to avoid the wait entirely. Rejected it:
+two clients can order the same optimistic pair of messages differently
+depending on arrival timing, which is the exact problem Decision 1 exists
+to solve — building an optimistic-then-reconciled UI on top of it would
+mean solving the ordering problem twice, plus visible message reordering
+on-screen when the "real" `seq` arrives and doesn't match the guessed
+position. The RPC round-trip costs low tens of milliseconds; the
+alternative costs correctness guarantees the whole read-receipt design
+depends on.
+
+SOLUTION
+`sendGroupMessage` (main service) requests `seq` + persistence via RPC to
+message service (`SendGroupMessage.js`), waits for the reply, then fans
+out: `SMEMBERS group:<groupId>:online` -> for each online member, `HGET
+socket:<userId>` (the existing 1:1 socket registry) -> emit. Only after
+fan-out completes does the sender's callback fire with the saved message.
+
+================================================================================
+DECISION 5 — Retry Safety: Isolate the Write from the Reply-Send
+================================================================================
+
+PURPOSE
+`CreateGroup.js` and `SendGroupMessage.js` both retry on transient DB
+connection failure, matching the existing retry convention in this codebase
+(`MarkDelivery.js`).
+
+PROBLEM
+Both consumers originally wrapped the DB write and the reply-send in the
+same `try/catch`. If the write succeeded but the reply-send itself then
+threw (channel hiccup, connection blip), the `catch` block couldn't tell
+"write failed" apart from "write succeeded, reply failed" — it retried the
+whole operation either way, including the write. For `CreateGroup.js` that
+means a duplicate group document. For `SendGroupMessage.js` it's worse: the
+retry calls `incrementGroupSeq` again too, so a false retry produces both a
+duplicate message and a burned `seq` number (a permanent gap in that
+group's sequence).
+
+This was a latent bug — never actually triggered in testing (every test run
+produced exactly one document), but the code path existed and would fire
+under the right failure timing.
+
+SOLUTION
+Split each consumer into two clearly separate concerns: a `*WithRetry`
+function that owns the DB write and retries only the write, and a
+`sendReply` function that's best-effort and never retried — if it throws,
+it's caught internally, logged, and dropped, since the document is already
+durably saved regardless of whether the reply gets through. Once the write
+function returns successfully, nothing downstream can trigger it to run
+again.
+
+HISTORY
+This bug shipped in the first working version of both files and wasn't
+caught by testing, because the failure only manifests when the reply-send
+specifically fails after a successful write — a narrower window than "the
+write failed," which is what the retry logic was actually built to handle.
+Caught by re-reading the `try/catch` boundary deliberately, not by
+reproducing the bug.
+
+================================================================================
+DECISION 6 — Group Schemas Live in Message Service, Not Main Service
+================================================================================
+
+PURPOSE
+`Group`, `GroupMessage`, `GroupSeqCounter`, and `GroupReadState` all need to
+live in one of the two services' MongoDB connections.
+
+PROBLEM
+`User` (and JWT/auth context) lives in main service. It's tempting to put
+`Group` there too, since group creation is triggered by an authenticated
+HTTP request in main service. But `GroupSeqCounter` has to be tightly
+coupled to `GroupMessage` — the increment is meaningless without the
+message it's ordering, and Decision 4 depends on both existing in the same
+transactional neighborhood, updated close together in time.
+
+SOLUTION
+All four schemas live in message service, matching how `messageSchema.js`
+already models cross-service references — plain `ObjectId` fields with no
+`ref: 'User'`, since `User` doesn't exist in message service's Mongoose
+connection. Main service reaches this data only via RPC (`CreateGroup`,
+`GetUserGroups`, `SendGroupMessage`), the same pattern already established
+for offline-delivery's message service calls.
+
+================================================================================
+DECISION 7 — Group Presence: Redis Set of Member IDs, Not Socket IDs
+================================================================================
+
+PURPOSE
+On send, the server needs to know which group members are currently online
+so it can fan out in real time.
+
+PROBLEM
+Two ways to store this in Redis: (a) `group:<groupId>:online` as a Set of
+userIds, looked up alongside the existing `socket:<userId>` registry per
+member, or (b) store `userId -> socketId` directly inside the group
+structure, saving a second lookup per online member.
+
+SOLUTION
+Went with (a). Storing socket IDs in two places (the existing per-user
+registry, and again inside each group's presence set) means every
+reconnect or disconnect has to update both to stay correct — miss one and
+a group's presence set silently holds a stale socket ID, with nothing to
+catch it. Two O(1) lookups per online member (`SMEMBERS` then `HGET`) costs
+the same complexity class as one lookup would — reaching N online members
+is O(N) either way, since you fundamentally have to touch each recipient
+once. Merging would only shave a constant factor, not the complexity class,
+in exchange for real correctness risk. Not worth it at this scale.
+
+On connect, whichever member connects first for a given group does the
+work of reading `Group.members` from Mongo (via the `getUserGroups` RPC)
+and populates that group's Redis set; later connections for the same group
+just add their own ID to the existing set rather than re-deriving it.

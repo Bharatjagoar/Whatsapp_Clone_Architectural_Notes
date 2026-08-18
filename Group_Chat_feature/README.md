@@ -25,7 +25,9 @@ changed along the way, including wrong turns that were corrected.
    existing per-user socket registry.
 4. **Read tracking** — as messages enter a member's viewport, their client
    fires a fire-and-forget event that advances a per-(user, group) read
-   pointer (`lastReadSeq`) in MongoDB.
+   pointer (`lastReadSeq`) in MongoDB. The sender's own pointer advances
+   automatically at send-time. When every other member has caught up to a
+   given message, the sender gets a live "read by everyone" notification.
 
 ## Files
 
@@ -36,10 +38,12 @@ changed along the way, including wrong turns that were corrected.
 | `processGroupMemberships.js` | Main | On connect, requests this user's group memberships, writes Redis presence |
 | `GetUserGroups.js` | Message | Answers the membership RPC by querying `Group.members` |
 | `GroupSeqCounter.js` | Message | Atomic per-group `$inc` counter handing out message sequence numbers |
-| `SendGroupMessage.js` | Message | Assigns `seq`, persists the message, replies over RPC |
+| `SendGroupMessage.js` | Message | Assigns `seq`, persists the message, advances sender's own read pointer, replies over RPC |
 | `sendGroupMessage` handler (`socket.js`) | Main | Requests seq+persist via RPC, fans out to online members on reply |
 | `GroupReadState.js` | Message | Schema + `markReadUpTo` — direct-set read pointer per (user, group) |
 | `markGroupRead` handler (`socket.js`) | Main | Fire-and-forget relay from client viewport events to the read-pointer write |
+| `MarkGroupRead.js` | Message | Writes the read pointer, checks whether the group is now fully read, publishes notify if so |
+| `notifyGroupReadByAll.js` | Main | Relays the "read by everyone" event to the sender's live socket |
 
 ## Decisions documented
 
@@ -90,15 +94,21 @@ Full reasoning for each is in
    member costs the same complexity class as one merged lookup would (both
    are O(N) for N online members) — not worth the correctness risk to save
    a constant factor.
+8. **Sender's own read pointer advances at send-time** — without this, a
+   sender's `lastReadSeq` never reflects messages they sent themselves,
+   which would corrupt any future unread-count badge (a sender's own sent
+   messages would count as their own unread) and leave them absent from
+   any future "seen by" list. Considered leaving this to frontend
+   inference instead; rejected, since `GroupReadState` is read by
+   server-side logic (decision 9) that a client-only fix can't reach.
+9. **"Read by everyone" notification via server-side aggregation** — after
+   each read-mark write, count non-sender members whose `lastReadSeq` has
+   caught up to that message and compare against total non-sender member
+   count; if they match, notify the sender's live socket. Runs on every
+   read-mark rather than tracking a separate per-message counter, trading
+   a couple of cheap reads per event for not maintaining extra state — the
+   same complexity-vs-correctness tradeoff already made in decision 3.
 
-## Known open items
-
-- No frontend UI for group chat yet — creation, send, and read-marking are
-  all verified working via a standalone Socket.IO test script
-  (`testGroupSend.js`), not through the actual client.
-- `markGroupRead`'s consumer (`MarkGroupRead.js`) does not retry on
-  transient DB failure, unlike `CreateGroup.js`/`SendGroupMessage.js` —
-  deliberate, per decision 3, not an oversight.
 
 ## Why this repo exists
 

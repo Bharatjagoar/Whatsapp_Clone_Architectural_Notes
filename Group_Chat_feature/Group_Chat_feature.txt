@@ -257,3 +257,87 @@ On connect, whichever member connects first for a given group does the
 work of reading `Group.members` from Mongo (via the `getUserGroups` RPC)
 and populates that group's Redis set; later connections for the same group
 just add their own ID to the existing set rather than re-deriving it.
+
+================================================================================
+DECISION 8 — Sender's Own Read Pointer Advances at Send-Time
+================================================================================
+
+PURPOSE
+`GroupReadState.lastReadSeq` needs to mean "the highest seq this user has
+actually seen" for every user, including the sender of a given message.
+
+PROBLEM
+Nothing in the original send path touched the sender's own `GroupReadState`
+document. A sends message `seq: 5`; `GroupSeqCounter.currentSeq` advances
+to 5; A's own `lastReadSeq` stays wherever it was before, unrelated to the
+message A just wrote. This creates a real, not hypothetical, correctness
+gap the moment either of two features gets built:
+  - Unread-count badges (`groupLatestSeq - myLastReadSeq`): A's own sent
+    messages would count as A's own unread messages, since A's pointer
+    never advances to include them. The badge would grow every time A
+    sends, purely from A's own activity.
+  - Any future "seen by" list for a message: A would be silently absent
+    from the seen-by list of A's own message, since A's `GroupReadState`
+    was never updated to reflect it.
+
+Considered leaving this to the frontend instead — since the sender's own
+client trivially knows "don't show my own message as unread to me,"
+skipping the backend write looked like it could save one write per send.
+Rejected: `GroupReadState` is not private client state. It's read
+server-side by other logic (Decision 9's aggregation, and any future
+seen-by list) — a purely client-side inference on the sender's own screen
+does nothing for what other members' clients or server-side aggregation
+see, since nothing was ever persisted for other services to read.
+
+SOLUTION
+`persistGroupMessage` (in `SendGroupMessage.js`) calls
+`markReadUpTo(senderId, groupId, seq)` immediately after creating the
+message, inside the same function that's already covered by the existing
+write-retry logic (Decision 5) — so this isn't a new write path with its
+own failure handling, it's folded into the write that was already being
+retried as a unit.
+
+================================================================================
+DECISION 9 — "Read By Everyone" Notification via Server-Side Aggregation
+================================================================================
+
+PURPOSE
+Give the sender a live signal (their "blue tick") when every other group
+member has read their message — the group analogue of 1:1's `read` status.
+
+PROBLEM
+No single write event naturally knows "was this the read-mark that finally
+completed the group's coverage of this message." Each `markGroupRead` call
+only knows about one user's read-state change; whether that change happens
+to be the *last* one needed requires knowing the group's full membership
+and every other member's current `lastReadSeq` — data that isn't in scope
+of a single read-mark event.
+
+SOLUTION
+After every successful `markReadUpTo` write in `MarkGroupRead.js`, run a
+check: look up the message's sender (so they can be excluded — they're
+already covered by Decision 8, not part of the "did others catch up"
+question), count how many non-sender members have `lastReadSeq >= seq`,
+and compare against the group's total non-sender member count. If they
+match, publish to a new `notifyGroupReadByAll` queue. A new main-service
+consumer (`notifyGroupReadByAll.js`, mirroring the existing
+`notifySenderRead.js` pattern) picks this up, looks up the sender's live
+socket via the existing Redis registry, and emits `groupMessageReadByAll`
+if they're connected.
+
+This check runs on *every* read-mark, not just the one that happens to
+complete the count — there's no cheaper way to know in advance which write
+will be the completing one without maintaining separate per-message read
+counters, which is more persistent state than the value justifies here.
+The two extra reads per read-mark (`Group.findById` for member count,
+`GroupReadState.countDocuments` for caught-up count) are accepted as the
+cost of not maintaining that extra state, consistent with Decision 3's
+general stance that this path favors simplicity over optimizing an
+already-cheap, high-frequency write.
+
+The notify-publish step is wrapped separately from the read-mark's own
+ack — if the aggregation check itself fails for any reason, the read-mark
+write is already acked and correct in the DB; only the live notification
+is skipped, following the same "the fact is already true in the DB, the
+live push is best-effort" pattern used throughout the read/delivery
+notification consumers in this codebase.
